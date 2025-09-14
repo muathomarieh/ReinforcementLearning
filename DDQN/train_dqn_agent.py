@@ -3,6 +3,9 @@ import numpy as np
 from dqn_agent import DQNAgent
 import matplotlib.pyplot as plt
 from enum import Enum
+import ale_py
+
+gym.register_envs(ale_py)
 
 
 class Env(Enum):
@@ -11,6 +14,7 @@ class Env(Enum):
     FrozenLake8x8 = "FrozenLake-v1-8x8"
     FrozenLake4x4 = "FrozenLake-v1-4x4"
     MountainCar = "MountainCar"
+    Breakout = "ALE/Breakout-v5"
 
     @staticmethod
     def _env_creators():
@@ -33,7 +37,9 @@ class Env(Enum):
             "MountainCar": lambda: gym.make(
                 "MountainCar-v0", max_episode_steps=999, render_mode="human"
             ),
-            "Breakout": lambda: gym.make("ALE/Breakout-v5"),
+            "ALE/Breakout-v5": lambda: gym.make(
+                "ALE/Breakout-v5", obs_type="grayscale", render_mode=None
+            ),
         }
 
     def make(self):
@@ -96,42 +102,113 @@ class MountainCarRewardWrapper(gym.Wrapper):
         return state, reward, terminated, truncated, info
 
 
+class AtariWrapper(gym.ObservationWrapper):
+    def __init__(self, env):
+        super().__init__(env)
+        self.observation_space = gym.spaces.Box(
+            low=0, high=255, shape=(84, 84, 1), dtype=np.uint8
+        )
+
+    def observation(self, obs):
+        import cv2
+
+        if obs.ndim == 3 and obs.shape[-1] == 3:
+            obs = cv2.cvtColor(obs, cv2.COLOR_RGB2GRAY)
+        elif obs.ndim == 2:
+            pass
+        else:
+            obs = obs.squeeze()
+        obs = cv2.resize(obs, (84, 84), interpolation=cv2.INTER_AREA)
+        return np.expand_dims(obs, axis=-1)
+
+
 def train(
     env,
     episodes=15000,
-    max_steps=200,  # Reduced max steps -> 1000 for the MountainCar
-    save_path="dqn_model_keras_FL_v0_8.keras",
+    max_steps=1000,  # Reduced max steps -> 1000 for the MountainCar
+    save_path="dqn_model_keras.keras",
 ):
-    discrete = isinstance(env.observation_space, gym.spaces.Discrete)
 
-    if discrete:
+    if (
+        hasattr(env.observation_space, "shape")
+        and len(env.observation_space.shape) >= 2
+    ):
+        state_shape = (
+            env.observation_space.shape + (1,)
+            if len(env.observation_space.shape) == 2
+            else env.observation_space.shape
+        )
+        is_atari = True
+
+        agent = DQNAgent(
+            state_shape=state_shape,
+            action_size=env.action_space.n,
+            gamma=0.99,
+            lr=0.01,
+            epsilon=1.0,
+            epsilon_decay=0.9999,
+            min_epsilon=0.05,
+            tau=0.001,
+            memory_size=50000,
+            batch_size=64,
+            update_frequency=16,
+        )
+    elif isinstance(env.observation_space, gym.spaces.Discrete):
         if hasattr(env.unwrapped, "nS"):
             n_states = env.unwrapped.nS
         else:
             n_states = env.observation_space.n
         state_shape = (n_states,)
+        is_atari = False
+
+        agent = DQNAgent(
+            state_shape=state_shape,
+            action_size=env.action_space.n,
+        )
+
     else:
         state_shape = env.observation_space.shape
+        is_atari = False
+
+        agent = DQNAgent(
+            state_shape=state_shape,
+            action_size=env.action_space.n,
+        )
+
+    print(f"Environment: {type(env.unwrapped).__name__}")
+    print(f"State shape: {state_shape}")
+    print(f"Action size: {env.action_space.n}")
+    print(f"Is Atari: {is_atari}")
+    print("-" * 50)
+
+    # discrete = isinstance(env.observation_space, gym.spaces.Discrete)
+
+    # if discrete:
+    #     if hasattr(env.unwrapped, "nS"):
+    #         n_states = env.unwrapped.nS
+    #     else:
+    #         n_states = env.observation_space.n
+    #     state_shape = (n_states,)
+    # else:
+    #     state_shape = env.observation_space.shape
 
     # hyperparameters
-    agent = DQNAgent(
-        state_shape=state_shape,
-        action_size=env.action_space.n,
-        discrete=discrete,
-        gamma=0.99,
-        lr=0.001,
-        epsilon=1.0,
-        epsilon_decay=0.995,
-        min_epsilon=0.01,
-        tau=0.01,
-        memory_size=10000,
-        batch_size=32,
-        update_frequency=4,
-    )
+    # agent = DQNAgent(
+    #     state_shape=state_shape,
+    #     action_size=env.action_space.n,
+    #     discrete=discrete,
+    #     gamma=0.99,
+    #     lr=0.001,
+    #     epsilon=1.0,
+    #     epsilon_decay=0.995,
+    #     min_epsilon=0.01,
+    #     tau=0.01,
+    #     memory_size=10000,
+    #     batch_size=32,
+    #     update_frequency=4,
+    # )
 
     rewards = []
-    losses = []
-    dones = []
     for ep in range(episodes):
         state, _ = env.reset()
         state = agent.preprocess_state(state)
@@ -152,66 +229,36 @@ def train(
             state = next_state
             total_reward += reward
 
-            if done:
-                dones.append(done)
-            if truncated:
-                print("Episode truncated (time limit)")
             if done or truncated:
                 break
 
-        epsilon = agent.update_epsilon()
+        agent.update_epsilon()
         rewards.append(total_reward)
 
-        # Check progress more frequently
-        window = min(100, len(rewards))
-        success_rate = sum(1 for r in rewards[-window:] if r > 0.5) / window
-        done_rate = sum(dones[-window:]) / window
-
-        if (ep + 1) % 500 == 0:
-            print(f"Episode: {ep + 1}, Epsilon: {epsilon:.3f}")
+        # Progress reporting
+        if (ep + 1) % 50 == 0:
+            window = min(50, len(rewards))
+            avg_reward = np.mean(rewards[-window:])
             print(
-                f"Average Reward over last {window} episodes: {np.mean(rewards[-window:]):.2f}"
+                f"Episode: {ep + 1}, Epsilon: {agent.epsilon:.4f}, Avg Reward: {avg_reward:.2f}"
             )
-            print(f"Success rate: {success_rate:.2%}")
-            print(f"done_rate: {done_rate:.2%}")
-            print("-" * 50)
 
-        # Early stopping with lower threshold initially
-        if done_rate >= 0.8 and len(rewards) >= 1000:
-            print(f"Solved in episode {ep + 1} with done_rate {done_rate:.2%}!")
-            break
-        # if success_rate >= 0.8 and len(rewards) >= 1000:
-        #     print(f"Solved in episode {ep + 1} with success rate {success_rate:.2%}!")
-        #     break
+        # Early stopping for Atari (based on average reward)
+        if is_atari and ep >= 100:
+            recent_avg = np.mean(rewards[-100:])
+            if recent_avg > 15:  # Good Breakout score threshold
+                print(f"Solved! Episode {ep + 1}, Average reward: {recent_avg:.2f}")
+                break
 
     agent.save(save_path)
-    print(f"Model saved at {save_path}")
+    print(f"Model saved: {save_path}")
 
-    # Plot training progress
-    plt.figure(figsize=(12, 4))
-
-    plt.subplot(1, 2, 1)
+    # Plot results
+    plt.figure(figsize=(10, 4))
     plt.plot(rewards)
-    plt.title("Rewards per Episode")
+    plt.title("Training Progress")
     plt.xlabel("Episode")
     plt.ylabel("Total Reward")
-
-    plt.subplot(1, 2, 2)
-    # Calculate rolling success rate
-    window_size = 100
-    success_rates = []
-    for i in range(window_size, len(rewards)):
-        window_rewards = rewards[i - window_size : i]
-        success_rate = sum(1 for r in window_rewards if r > 0.5) / window_size
-        success_rates.append(success_rate)
-
-    plt.plot(success_rates)
-    plt.title(f"Success Rate")
-    plt.xlabel("Episode")
-    plt.ylabel("Success Rate")
-    plt.ylim(0, 1)
-
-    plt.tight_layout()
     plt.show()
 
     return agent
@@ -252,13 +299,13 @@ def test_agent(agent, env, episodes=100):
     return success_rate, avg_reward
 
 
-# Run training
 if __name__ == "__main__":
-    # Create environment
+
     # env = RewardWrapper(gym.make("FrozenLake-v1", map_name="8x8", is_slippery=False))
-    env_enum = Env.CartPole
+    env_enum = Env.Breakout
     env_instance = env_enum.make()
+    env_for_atari = AtariWrapper(env_instance)
 
     print(f"Training DQN on {env_enum.env_name()}: ")
-    agent = train(env_instance, save_path=f"{env_enum.env_name()}.keras")
-    test_agent(agent, env_instance)
+    agent = train(env_for_atari, save_path=f"{env_enum.env_name()}.keras")
+    test_agent(agent, env_for_atari)

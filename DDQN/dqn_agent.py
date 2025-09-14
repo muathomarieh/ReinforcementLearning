@@ -1,11 +1,16 @@
 import numpy as np
 import tensorflow as tf
 from tensorflow.keras import Sequential
-from tensorflow.keras.layers import Dense, Input
+from tensorflow.keras.layers import Dense, Input, Conv2D, MaxPooling2D, Flatten
 from tensorflow.keras.losses import Huber
 from tensorflow.keras.optimizers import Adam
 from collections import deque, namedtuple
 import random
+
+
+gpus = tf.config.experimental.list_physical_devices("GPU")
+if gpus:
+    tf.config.experimental.set_memory_growth(gpus[0], True)
 
 Experience = namedtuple(
     "Experience", ["state", "action", "reward", "next_state", "done"]
@@ -17,7 +22,6 @@ class DQNAgent:
         self,
         state_shape,
         action_size,
-        discrete=True,
         gamma=0.99,
         lr=0.001,
         epsilon=1.0,
@@ -30,7 +34,6 @@ class DQNAgent:
     ):
         self.state_shape = state_shape
         self.action_size = action_size
-        self.discrete = discrete
 
         self.gamma = gamma
         self.lr = lr
@@ -55,8 +58,20 @@ class DQNAgent:
         self.global_step = 0
 
     def _build_network(self):
-        """Build neural network architecture suitable for the problem size"""
-        if self.discrete and self.state_shape[0] <= 64:  # Small discrete spaces
+        """Optimal network architecture for Atari games"""
+        if len(self.state_shape) == 3:
+            return Sequential(
+                [
+                    Input(shape=self.state_shape),
+                    Conv2D(32, (8, 8), strides=4, activation="relu", name="conv1"),
+                    Conv2D(64, (4, 4), strides=2, activation="relu", name="conv2"),
+                    Conv2D(64, (3, 3), strides=1, activation="relu", name="conv3"),
+                    Flatten(),
+                    Dense(512, activation="relu", name="fc1"),
+                    Dense(self.action_size, activation="linear", name="q_values"),
+                ]
+            )
+        elif len(self.state_shape) == 1 and self.state_shape[0] <= 64:  # Small discrete
             return Sequential(
                 [
                     Input(shape=self.state_shape),
@@ -70,48 +85,54 @@ class DQNAgent:
             return Sequential(
                 [
                     Input(shape=self.state_shape),
-                    Dense(64, activation="relu"),
-                    Dense(64, activation="relu"),
+                    Dense(256, activation="relu"),
+                    Dense(256, activation="relu"),
+                    Dense(128, activation="relu"),
                     Dense(self.action_size, activation="linear"),
                 ]
             )
 
     def append_new_experience(self, state, action, reward, next_state, done):
-        self.memory.append(Experience(state, action, reward, next_state, done))
+        self.memory.append(
+            Experience(
+                state.astype(np.float32),
+                action,
+                reward,
+                next_state.astype(np.float32),
+                done,
+            )
+        )
 
     def get_action(self, state, env):
         """Epsilon-greedy policy"""
         if np.random.rand() < self.epsilon:
             return env.action_space.sample()
 
-        if len(state.shape) == 1:
-            state_input = np.expand_dims(state, axis=0)
-        else:
-            state_input = state
+        # if len(state.shape) == 1:
+        state_input = np.expand_dims(state, axis=0)
 
         q_values = self.q_network(state_input, training=False)
         return np.argmax(q_values.numpy()[0])
 
     def predict_action(self, state):
         """Get action without exploration (for testing)"""
-        if len(state.shape) == 1:
-            state_input = np.expand_dims(state, axis=0)
-        else:
-            state_input = state
-
+        state_input = np.expand_dims(state, axis=0)
         q_values = self.q_network(state_input, training=False)
         return int(np.argmax(q_values[0]))
 
     def preprocess_state(self, state):
-        """Convert state to proper tensor format"""
-        if self.discrete:
-            n_states = self.state_shape[0]
+        """Preprocess state for the network"""
+        if len(self.state_shape) == 3:
+            if len(state.shape) == 2:
+                state = np.expand_dims(state, axis=-1)
+            return state.astype(np.float32) / 255.0
+
+        elif len(self.state_shape) == 1 and self.state_shape[0] <= 64:
             if isinstance(state, (int, np.integer)):
-                one_hot = np.zeros(n_states, dtype=np.float32)
+                one_hot = np.zeros(self.state_shape[0], dtype=np.float32)
                 one_hot[state] = 1.0
                 return one_hot
-            else:
-                return np.array(state, dtype=np.float32)
+            return np.array(state, dtype=np.float32)
         else:
             return np.array(state, dtype=np.float32)
 
@@ -136,10 +157,27 @@ class DQNAgent:
         # Compute target Q-values
         target_q_values = rewards + (1.0 - dones) * self.gamma * max_next_q_values
 
-        # Stop gradients on targets
         target_q_values = tf.stop_gradient(target_q_values)
 
         return self.loss_fn(target_q_values, current_q_values)
+
+    @tf.function
+    def agent_learn(self, experiences):
+        with tf.GradientTape() as tape:
+            loss = self.compute_loss(experiences=experiences)
+
+        grads = tape.gradient(loss, self.q_network.trainable_variables)
+        clipped_grads = [tf.clip_by_norm(grad, 1.0) for grad in grads]
+        self.optimizer.apply_gradients(
+            zip(clipped_grads, self.q_network.trainable_variables)
+        )
+
+        # Soft update target network
+        for target_param, param in zip(
+            self.target_network.trainable_variables,
+            self.q_network.trainable_variables,
+        ):
+            target_param.assign(param * self.tau + target_param * (1.0 - self.tau))
 
     def start_training(self):
         return (
@@ -167,28 +205,10 @@ class DQNAgent:
             np.array([e.next_state for e in experiences]), dtype=tf.float32
         )
         dones = tf.convert_to_tensor(
-            np.array([e.done for e in experiences], dtype=np.float32), dtype=tf.float32
+            np.array([e.done for e in experiences]), dtype=tf.float32
         )
 
         return (states, actions, rewards, next_states, dones)
-
-    @tf.function
-    def agent_learn(self, experiences):
-        with tf.GradientTape() as tape:
-            loss = self.compute_loss(experiences=experiences)
-
-        grads = tape.gradient(loss, self.q_network.trainable_variables)
-        clipped_grads = [tf.clip_by_norm(grad, 1.0) for grad in grads]
-        self.optimizer.apply_gradients(
-            zip(clipped_grads, self.q_network.trainable_variables)
-        )
-
-        # Soft update target network
-        for target_param, param in zip(
-            self.target_network.trainable_variables,
-            self.q_network.trainable_variables,
-        ):
-            target_param.assign(param * self.tau + target_param * (1.0 - self.tau))
 
     def save(self, path):
         self.q_network.save(path)
